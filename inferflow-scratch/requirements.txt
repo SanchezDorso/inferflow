@@ -1,0 +1,12 @@
+# torch 请按 CUDA 版本从官方源安装，例如：
+#   pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+torch>=2.4
+transformers>=4.51,<5
+safetensors
+xxhash
+numpy
+tqdm
+huggingface_hub
+pytest
+# flash-attn 需匹配 torch/CUDA/Python 版本，推荐 scripts/setup_env.sh 自动选择预编译 wheel
+flash-attn>=2.6
