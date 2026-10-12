@@ -41,15 +41,15 @@ class Scheduler:
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs: list[Sequence] = []
-        num_seqs = 0
         num_batched_tokens = 0
 
-        while self.waiting and num_seqs < self.max_num_seqs:
+        # max_num_seqs 限制的是 running 中的并发总数，而不是单次 prefill 的条数。
+        # token 预算把 prefill 拆成多步时，后面的步也只能填满剩余槽位。
+        while self.waiting and len(self.running) < self.max_num_seqs:
             seq = self.waiting[0]
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
             self.block_manager.allocate(seq)
-            num_seqs += 1
             num_batched_tokens += len(seq) - seq.num_cached_tokens
             if seq.num_completion_tokens == 0:
                 self.num_prompt_tokens += len(seq)
@@ -62,6 +62,7 @@ class Scheduler:
         if scheduled_seqs:
             return scheduled_seqs, True
 
+        num_seqs = 0
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):

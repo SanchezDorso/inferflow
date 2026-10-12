@@ -1,7 +1,9 @@
 import atexit
+import gc
 from dataclasses import fields
 from time import perf_counter
 
+import torch
 import torch.multiprocessing as mp
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, GenerationConfig
@@ -53,6 +55,9 @@ class LLMEngine:
         del self.model_runner
         for p in self.ps:
             p.join()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams) -> int:
         if isinstance(prompt, str):

@@ -20,9 +20,9 @@ def main():
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
 
     questions = [
-        "介绍一下你自己",
+        "介绍一下你自己，并列举你的三个优点",
         "list all prime numbers within 100",
-        "用三句话解释 PagedAttention 的核心思想",
+        "用三句话解释 毛泽东思想",
     ]
     prompts = [
         tokenizer.apply_chat_template(

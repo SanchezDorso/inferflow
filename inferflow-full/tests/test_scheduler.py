@@ -57,6 +57,18 @@ def test_max_num_seqs():
     assert len(scheduled) == 3
 
 
+def test_max_num_seqs_caps_running_across_prefill_steps():
+    # 每步 token 预算只够 2 条，并发上限是 3：第二步只能再收 1 条。
+    s = make_scheduler(num_blocks=64, max_num_seqs=3, max_num_batched_tokens=100, max_model_len=64)
+    for i in range(8):
+        s.add(make_seq(40, start=i * 100, max_tokens=1))
+    scheduled, is_prefill = s.schedule()
+    assert is_prefill and len(scheduled) == 2 and len(s.running) == 2
+    scheduled, is_prefill = s.schedule()
+    assert is_prefill and len(scheduled) == 1 and len(s.running) == 3
+    assert len(s.waiting) == 5
+
+
 def test_decode_after_prefill_and_finish():
     s = make_scheduler()
     seq = make_seq(10, max_tokens=2)

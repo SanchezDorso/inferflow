@@ -79,10 +79,16 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
+        self.kv_cache = None
+        self.model = None
+        self.sampler = None
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            self.graphs = None
+            self.graph_pool = None
+            self.graph_vars = None
         if self.is_cuda:
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         dist.destroy_process_group()
 
     # ---------------- 多进程 RPC ----------------
