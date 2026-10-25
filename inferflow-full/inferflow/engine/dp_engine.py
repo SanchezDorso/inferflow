@@ -1,7 +1,7 @@
 """按请求把推理分到多张卡。
 
 Qwen3-0.6B 放得进单卡。张量并行每层都要 all-reduce，PCIe 上的通信比省下的计算还多，
-卡越多越慢。这里每张卡留一份完整模型，各自跑连续批处理；空闲的卡从公共队列取下一条请求。
+卡越多越慢。这里每张卡留一份完整模型，各自跑连续批处理。主进程按已分配的 prompt token 数把请求交给当前最闲的卡。
 """
 
 import multiprocessing as mp
@@ -93,12 +93,10 @@ class DataParallelLLM:
         self._exited = False
 
         ctx = mp.get_context("spawn")
-        self._request_q = ctx.Queue()
+        self._request_qs = [ctx.Queue() for _ in range(data_parallel_size)]
         self._result_q = ctx.Queue()
         self._barrier = ctx.Barrier(data_parallel_size + 1)
         port_base = 25000 + (os.getpid() % 2000)
-        # 每步只取一小批，正在 prefill/decode 时别的卡还能从队列里拿走请求。
-        pull_per_step = 16
         self._procs = []
         # 子进程在 import torch 时就会初始化 CUDA。可见卡必须在 Process.start 之前写进环境，
         # 写在 worker 函数里已经晚了，两张卡会抢同一块 GPU。
@@ -111,9 +109,10 @@ class DataParallelLLM:
                 }
                 engine_kwargs["tensor_parallel_size"] = 1
                 engine_kwargs["dist_port"] = port_base + rank
+                pull_per_step = engine_kwargs.get("max_num_seqs", 512)
                 proc = ctx.Process(
                     target=_worker,
-                    args=(rank, model, engine_kwargs, self._request_q, self._result_q, self._barrier, pull_per_step),
+                    args=(rank, model, engine_kwargs, self._request_qs[rank], self._result_q, self._barrier, pull_per_step),
                 )
                 proc.start()
                 self._procs.append(proc)
@@ -148,8 +147,11 @@ class DataParallelLLM:
         if len(sampling_params) != len(prompts):
             raise ValueError("sampling_params 与 prompts 数量不一致")
         encoded = [self.tokenizer.encode(prompt) if isinstance(prompt, str) else list(prompt) for prompt in prompts]
+        assigned_tokens = [0] * self.data_parallel_size
         for origin, (token_ids, params) in enumerate(zip(encoded, sampling_params)):
-            self._request_q.put((origin, token_ids, params))
+            rank = min(range(self.data_parallel_size), key=lambda i: (assigned_tokens[i], i))
+            assigned_tokens[rank] += len(token_ids)
+            self._request_qs[rank].put((origin, token_ids, params))
         pending = len(encoded)
         token_ids_out: list[list[int] | None] = [None] * pending
         counts = [0] * self.data_parallel_size
@@ -174,8 +176,8 @@ class DataParallelLLM:
         if self._exited:
             return
         self._exited = True
-        for _ in self._procs:
-            self._request_q.put(None)
+        for request_q in self._request_qs:
+            request_q.put(None)
         for proc in self._procs:
             proc.join(timeout=120)
             if proc.is_alive():
