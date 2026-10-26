@@ -4,8 +4,14 @@ from torch import nn
 
 class Sampler(nn.Module):
 
-    @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor) -> torch.Tensor:
+        # 全贪心时词表 softmax 会被扔掉。0.6B 的词表有 15 万维，这是解码步上的大头之一。
+        if torch.all(temperatures == 0):
+            return logits.argmax(dim=-1)
+        return self._sample(logits, temperatures)
+
+    @torch.compile
+    def _sample(self, logits: torch.Tensor, temperatures: torch.Tensor) -> torch.Tensor:
         logits = logits.float()
         greedy_tokens = logits.argmax(dim=-1)
         is_greedy = temperatures == 0

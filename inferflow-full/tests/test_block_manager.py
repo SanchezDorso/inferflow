@@ -83,6 +83,22 @@ def test_same_tokens_different_prefix_no_false_hit():
     assert b.num_cached_tokens == 256
 
 
+def test_can_allocate_ignores_shared_prefix_blocks():
+    bm = BlockManager(num_blocks=4, block_size=BS)
+    shared = list(range(512))
+    a = make_seq(shared + [1, 2, 3])
+    bm.allocate(a)
+    assert bm.num_free_blocks == 1
+    b = make_seq(shared + [4, 5])
+    needed, cached = bm.preview(b)
+    assert cached == 512
+    assert needed == 1
+    assert bm.can_allocate(b)
+    bm.allocate(b)
+    assert b.num_cached_tokens == cached
+    assert bm.num_free_blocks == 0
+
+
 def test_prefix_caching_disabled():
     bm = BlockManager(num_blocks=8, block_size=BS, enable_prefix_caching=False)
     a = make_seq(list(range(600)))

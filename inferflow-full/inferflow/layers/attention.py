@@ -125,9 +125,12 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel():
+        use_flash = flash_attn_varlen_func is not None and q.is_cuda
+        # decode 把新的 K/V 交给 flash_attn_with_kvcache 写入，省掉每层一次额外的 store kernel。
+        fuse_decode_store = use_flash and not context.is_prefill and k_cache.numel()
+        if k_cache.numel() and v_cache.numel() and not fuse_decode_store:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-        if flash_attn_varlen_func is None or not q.is_cuda:
+        if not use_flash:
             return reference_attention(q, k, v, k_cache, v_cache, context, self.scale)
         if context.is_prefill:
             if context.block_tables is not None:
@@ -144,11 +147,14 @@ class Attention(nn.Module):
                 causal=True,
                 block_table=context.block_tables,
             )
+        # cache_seqlens 是写入前的长度，kernel 从这里追加本步的 K/V。
         return flash_attn_with_kvcache(
             q.unsqueeze(1),
             k_cache,
             v_cache,
-            cache_seqlens=context.context_lens,
+            k=k.unsqueeze(1),
+            v=v.unsqueeze(1),
+            cache_seqlens=context.context_lens - 1,
             block_table=context.block_tables,
             softmax_scale=self.scale,
             causal=True,

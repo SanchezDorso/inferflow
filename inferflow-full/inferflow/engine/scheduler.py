@@ -47,7 +47,9 @@ class Scheduler:
         # token 预算把 prefill 拆成多步时，后面的步也只能填满剩余槽位。
         while self.waiting and len(self.running) < self.max_num_seqs:
             seq = self.waiting[0]
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+            _, cached_tokens = self.block_manager.preview(seq)
+            new_tokens = len(seq) - cached_tokens
+            if num_batched_tokens + new_tokens > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
             self.block_manager.allocate(seq)
             num_batched_tokens += len(seq) - seq.num_cached_tokens

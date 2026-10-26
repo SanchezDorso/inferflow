@@ -43,6 +43,9 @@ class ModelRunner:
             rank=rank,
         )
         if self.is_cuda:
+            from inferflow.utils.affinity import bind_current_process_to_gpu, physical_gpu_index
+
+            bind_current_process_to_gpu(physical_gpu_index(rank))
             torch.cuda.set_device(rank)
         else:
             torch._dynamo.config.disable = True
@@ -261,13 +264,20 @@ class ModelRunner:
         graph_vars["context_lens"][:bs] = context.context_lens
         graph_vars["block_tables"][:bs, : context.block_tables.size(1)] = context.block_tables
         graph.replay()
+        if self.graph_logits:
+            return graph_vars["logits"][:bs]
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | None:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = None
+        if self.rank == 0:
+            # 全贪心时不要先做一次 GPU all() 再同步，否则每个解码步多一次往返。
+            if all(seq.temperature == 0.0 for seq in seqs):
+                token_ids = logits.argmax(dim=-1).tolist()
+            else:
+                token_ids = self.sampler(logits, self.prepare_sample(seqs)).tolist()
         reset_context()
         return token_ids
 
@@ -280,9 +290,14 @@ class ModelRunner:
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        # decode 的 flash kernel 用 context_lens - 1 作为写入位置，捕获时不能是负数。
+        context_lens = torch.ones(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, config.hf_config.hidden_size)
+        # 单卡时把 lm_head 一并录进图。多卡 gather 留在图外，避免 NCCL 进 CUDA Graph。
+        self.graph_logits = self.world_size == 1
+        vocab = config.hf_config.vocab_size
+        logits = torch.zeros(max_bs, vocab, dtype=config.torch_dtype) if self.graph_logits else None
         self.graph_bs = sorted({bs for bs in [1, 2, 4, 8, *range(16, max_bs + 1, 16)] if bs <= max_bs} | {max_bs})
         self.graphs = {}
         self.graph_pool = None
@@ -290,9 +305,17 @@ class ModelRunner:
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+            hidden = self.model(input_ids[:bs], positions[:bs])
+            if self.graph_logits:
+                logits[:bs] = self.model.compute_logits(hidden)
+            else:
+                outputs[:bs] = hidden
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                hidden = self.model(input_ids[:bs], positions[:bs])
+                if self.graph_logits:
+                    logits[:bs] = self.model.compute_logits(hidden)
+                else:
+                    outputs[:bs] = hidden
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
@@ -306,4 +329,5 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             outputs=outputs,
+            logits=logits,
         )

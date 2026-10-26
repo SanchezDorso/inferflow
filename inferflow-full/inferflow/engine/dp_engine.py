@@ -18,6 +18,9 @@ def _gpu_count() -> int:
 def _worker(rank, model, engine_kwargs, request_q, result_q, barrier, pull_per_step):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    from inferflow.utils.affinity import bind_current_process_to_gpu
+
+    bind_current_process_to_gpu(rank)
     from inferflow import LLM, SamplingParams
 
     llm = None
@@ -148,8 +151,19 @@ class DataParallelLLM:
             raise ValueError("sampling_params 与 prompts 数量不一致")
         encoded = [self.tokenizer.encode(prompt) if isinstance(prompt, str) else list(prompt) for prompt in prompts]
         assigned_tokens = [0] * self.data_parallel_size
+        # 前缀缓存是每张卡私有的。相同的满块前缀固定分到同一张卡，负载已经更高时改走最闲的卡。
+        block_size = 256
+        sticky: dict[tuple[int, ...], int] = {}
         for origin, (token_ids, params) in enumerate(zip(encoded, sampling_params)):
-            rank = min(range(self.data_parallel_size), key=lambda i: (assigned_tokens[i], i))
+            prefix = tuple(token_ids[:block_size]) if len(token_ids) >= block_size else None
+            least = min(range(self.data_parallel_size), key=lambda i: (assigned_tokens[i], i))
+            rank = least
+            if prefix is not None and prefix in sticky:
+                pinned = sticky[prefix]
+                if assigned_tokens[pinned] <= assigned_tokens[least] + len(token_ids):
+                    rank = pinned
+            if prefix is not None:
+                sticky.setdefault(prefix, rank)
             assigned_tokens[rank] += len(token_ids)
             self._request_qs[rank].put((origin, token_ids, params))
         pending = len(encoded)

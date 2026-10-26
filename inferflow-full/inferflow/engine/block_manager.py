@@ -68,8 +68,43 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    def preview(self, seq: Sequence) -> tuple[int, int]:
+        """分配前预估 (要从空闲链表取走的块数, 可复用的 token 数)。
+
+        与 allocate 同一套规则：命中正在使用的满块只增加引用计数；
+        命中空闲块或缓存未命中都要拿走一个空闲块；最后一块始终重算。
+        """
+        if not self.enable_prefix_caching:
+            return seq.num_blocks, 0
+        h = -1
+        cache_miss = False
+        needed = 0
+        cached = 0
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            full = len(token_ids) == self.block_size
+            h = self.compute_hash(token_ids, h) if full else -1
+            block_id = self.hash_to_block_id.get(h, -1)
+            block = self.blocks[block_id] if block_id != -1 else None
+            hit = (
+                not cache_miss
+                and i != seq.num_blocks - 1
+                and block is not None
+                and block.hash == h
+                and block.token_ids == token_ids
+            )
+            if hit:
+                cached += self.block_size
+                if block_id not in self.used_block_ids:
+                    needed += 1
+            else:
+                cache_miss = True
+                needed += 1
+        return needed, cached
+
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        needed, _ = self.preview(seq)
+        return len(self.free_block_ids) >= needed
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
