@@ -200,9 +200,14 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens :])
-            positions.extend(range(seq.num_cached_tokens, seqlen))
-            seqlen_q = seqlen - seq.num_cached_tokens
+            # Decode 只算最后一个词，历史 KV 从分页缓存读。Prefill 从尚未命中的位置算到结尾。
+            q_start = seq.num_cached_tokens if seq.in_prefill else seqlen - 1
+            if seq.in_prefill:
+                input_ids.extend(seq[q_start:])
+            else:
+                input_ids.append(seq.last_token)
+            positions.extend(range(q_start, seqlen))
+            seqlen_q = seqlen - q_start
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
@@ -210,10 +215,13 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                end = start + (self.block_size if i != seq.num_blocks - 1 else seq.last_block_num_tokens)
-                slot_mapping.extend(range(start, end))
+            if seq.in_prefill:
+                for i in range(seq.num_cached_blocks, seq.num_blocks):
+                    start = seq.block_table[i] * self.block_size
+                    end = start + (self.block_size if i != seq.num_blocks - 1 else seq.last_block_num_tokens)
+                    slot_mapping.extend(range(start, end))
+            else:
+                slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
         # 存在前缀缓存命中时 K 比 Q 长，需要通过 block_table 从 KV cache 读取完整 K/V
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)

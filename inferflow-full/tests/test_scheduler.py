@@ -34,8 +34,11 @@ def test_prefill_fifo_and_token_budget():
     scheduled, is_prefill = s.schedule()
     assert is_prefill
     assert scheduled == seqs[:2]  # 400 + 400 <= 1024 < 1200
+    # 已经在运行的两条继续 Decode，剩下的 Prefill 进同一批。2 + 400 + 400 <= 1024。
     scheduled, is_prefill = s.schedule()
-    assert is_prefill and scheduled == seqs[2:]
+    assert is_prefill
+    assert [seq for seq in scheduled if not seq.in_prefill] == seqs[:2]
+    assert [seq for seq in scheduled if seq.in_prefill] == seqs[2:]
 
 
 def test_prefill_blocked_head_does_not_skip():
@@ -64,8 +67,10 @@ def test_max_num_seqs_caps_running_across_prefill_steps():
         s.add(make_seq(40, start=i * 100, max_tokens=1))
     scheduled, is_prefill = s.schedule()
     assert is_prefill and len(scheduled) == 2 and len(s.running) == 2
+    # 第二步：2 条 Decode 加 1 条 Prefill，并发达到 3。
     scheduled, is_prefill = s.schedule()
-    assert is_prefill and len(scheduled) == 1 and len(s.running) == 3
+    assert is_prefill and len(scheduled) == 3 and len(s.running) == 3
+    assert sum(seq.in_prefill for seq in scheduled) == 1
     assert len(s.waiting) == 5
 
 
@@ -114,6 +119,28 @@ def test_decode_preemption_and_rollback():
     # 已生成的 token 保留，恢复时整体 recompute
     assert c.completion_token_ids == [1]
     assert list(s.running) == [a, b]
+
+
+def test_new_request_joins_decode_batch():
+    # A、B、C 正在 Decode；A 完成后释放 KV；下一步 B、C 继续 Decode，同时 Prefill D。
+    s = make_scheduler(num_blocks=32, max_num_batched_tokens=4096)
+    a = make_seq(10, start=0, max_tokens=1)
+    b = make_seq(10, start=100, max_tokens=8)
+    c = make_seq(10, start=200, max_tokens=8)
+    for seq in (a, b, c):
+        s.add(seq)
+    scheduled, is_prefill = s.schedule()
+    assert is_prefill and scheduled == [a, b, c]
+    s.postprocess(scheduled, [1, 1, 1])
+    assert a.is_finished
+    assert a.block_table == []
+    d = make_seq(10, start=300, max_tokens=4)
+    s.add(d)
+    scheduled, is_prefill = s.schedule()
+    assert is_prefill
+    assert [seq for seq in scheduled if not seq.in_prefill] == [b, c]
+    assert [seq for seq in scheduled if seq.in_prefill] == [d]
+    assert d.block_table
 
 
 def test_preempted_seq_resumes():

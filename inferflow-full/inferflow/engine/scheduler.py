@@ -7,13 +7,12 @@ from inferflow.engine.sequence import Sequence, SequenceStatus
 
 class Scheduler:
     """
-    两阶段调度：
-    1. Prefill：严格 FIFO，按到达顺序尽可能多地接纳 waiting 队列头部的请求，
-       受 max_num_seqs / max_num_batched_tokens / 空闲 KV 块三重约束；
-    2. Decode：没有可 prefill 的请求时，对 running 队列做一步解码。
-       若 KV 块不足，从 running 队尾（最晚进入的请求）开始抢占：
-       释放其全部 KV 块、状态回滚为 WAITING 并插回 waiting 队首，
-       之后以 recompute 的方式（prompt + 已生成 token 一起重新 prefill）恢复。
+    连续批处理：每一步可以同时包含 Decode 和 Prefill。
+
+    先给 running 里的请求各排 1 个 decode token，保证已经在生成的请求不被新提示堵住。
+    剩下的 token 预算再按 FIFO 接纳 waiting：队头放不下就停，后面的短请求不能插队。
+    本步刚被抢占的请求留在 waiting，下一拍再和其余 Decode 一起重算。
+    显存不足时从 running 队尾抢占，已生成的 token 保留，之后整段重新 Prefill。
     """
 
     def __init__(self, config: Config):
@@ -42,11 +41,34 @@ class Scheduler:
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs: list[Sequence] = []
         num_batched_tokens = 0
+        preempted: set[int] = set()
 
-        # max_num_seqs 限制的是 running 中的并发总数，而不是单次 prefill 的条数。
-        # token 预算把 prefill 拆成多步时，后面的步也只能填满剩余槽位。
+        # 先排 Decode。本步刚抢占的请求留在 waiting，避免把刚腾出的块立刻占回去。
+        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+            if num_batched_tokens + 1 > self.max_num_batched_tokens:
+                break
+            seq = self.running.popleft()
+            while not self.block_manager.can_append(seq):
+                if self.running:
+                    victim = self.running.pop()
+                    self.preempt(victim)
+                    preempted.add(victim.seq_id)
+                else:
+                    self.preempt(seq)
+                    preempted.add(seq.seq_id)
+                    break
+            else:
+                num_batched_tokens += 1
+                self.block_manager.may_append(seq)
+                seq.in_prefill = False
+                scheduled_seqs.append(seq)
+        self.running.extendleft(reversed(scheduled_seqs))
+
+        # 剩余预算按 FIFO 接 Prefill，和上面的 Decode 放进同一批。
         while self.waiting and len(self.running) < self.max_num_seqs:
             seq = self.waiting[0]
+            if seq.seq_id in preempted:
+                break
             _, cached_tokens = self.block_manager.preview(seq)
             new_tokens = len(seq) - cached_tokens
             if num_batched_tokens + new_tokens > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
@@ -61,25 +83,7 @@ class Scheduler:
             self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs.append(seq)
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        num_seqs = 0
-        while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                num_seqs += 1
-                self.block_manager.may_append(seq)
-                seq.in_prefill = False
-                scheduled_seqs.append(seq)
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        return scheduled_seqs, any(seq.in_prefill for seq in scheduled_seqs)
 
     def preempt(self, seq: Sequence):
         self.num_preemptions += 1

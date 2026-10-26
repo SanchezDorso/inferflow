@@ -71,7 +71,9 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         if not seqs:
             return [], 0
-        num_tokens = sum(len(seq) - seq.num_cached_tokens for seq in seqs) if is_prefill else -len(seqs)
+        # 混批里 Decode 只占 1 个词。正数只统计本步新算的 Prefill 词，纯 Decode 仍用负数。
+        prefill_tokens = sum(len(seq) - seq.num_cached_tokens for seq in seqs if seq.in_prefill)
+        num_tokens = prefill_tokens if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
