@@ -1,12 +1,15 @@
+import os
 import pickle
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
 from inferflow.config import Config
 from inferflow.engine.sequence import Sequence
+from inferflow.layers.flashinfer_decode import flashinfer_decode_enabled, plan_decode
 from inferflow.layers.sampler import Sampler
 from inferflow.models.qwen3 import Qwen3ForCausalLM
 from inferflow.utils.context import get_context, reset_context, set_context
@@ -55,8 +58,14 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        # warmup 的 prefill 会走到 run_model，属性要先存在。KV 页在 allocate 之后才有。
+        self.flashinfer_decode = self.is_cuda and flashinfer_decode_enabled()
+        self._fi_attn = None
         self.warmup_model()
         self.allocate_kv_cache()
+        if self.flashinfer_decode:
+            self._fi_attn = next(m for m in self.model.modules() if hasattr(m, "k_cache") and m.k_cache.numel())
+        self.graph_bs = [1]
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -145,7 +154,14 @@ class ModelRunner:
         hf_config = config.hf_config
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", None) or hf_config.hidden_size // hf_config.num_attention_heads
-        dtype = config.torch_dtype
+        # 前缀缓存关闭时 KV 用 fp8。同样的显存放两倍 token，decode 每次仍读满整张 cache，
+        # 但每个 token 只有一半字节，同样的步长能吐出大约两倍的 token。
+        self.fp8_kv = (
+            self.flashinfer_decode
+            and not config.enable_prefix_caching
+            and os.environ.get("INFERFLOW_FP8_KV", "1") != "0"
+        )
+        dtype = torch.float8_e4m3fn if self.fp8_kv else config.torch_dtype
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * dtype.itemsize
 
         if self.is_cuda:
@@ -177,21 +193,38 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
         if self.rank == 0:
+            kind = "fp8 e4m3" if self.fp8_kv else str(dtype).replace("torch.", "")
             print(
                 f"[InferFlow] KV cache: {config.num_kvcache_blocks} blocks x {self.block_size} tokens "
-                f"({config.num_kvcache_blocks * block_bytes / 2**30:.2f} GiB per rank)"
+                f"({config.num_kvcache_blocks * block_bytes / 2**30:.2f} GiB per rank, {kind})"
             )
 
     # ---------------- 输入准备 ----------------
 
     def _to_device(self, data, dtype) -> torch.Tensor:
+        if isinstance(data, np.ndarray):
+            # torch.tensor(..., pin_memory=True) 不能直接包 numpy。
+            np_dtype = {
+                torch.int32: np.int32,
+                torch.int64: np.int64,
+                torch.float32: np.float32,
+            }[dtype]
+            array = np.ascontiguousarray(data, dtype=np_dtype)
+            t = torch.from_numpy(array)
+            if self.is_cuda:
+                t = t.pin_memory().to(self.device, non_blocking=True)
+            return t
         t = torch.tensor(data, dtype=dtype, device="cpu", pin_memory=self.is_cuda)
         return t.to(self.device, non_blocking=True)
 
     def prepare_block_tables(self, seqs: list[Sequence]) -> torch.Tensor:
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        return self._to_device(block_tables, torch.int32)
+        table = np.full((len(seqs), max_len), -1, dtype=np.int32)
+        for i, seq in enumerate(seqs):
+            n = len(seq.block_table)
+            if n:
+                table[i, :n] = seq.block_table
+        return self._to_device(table, torch.int32)
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids, positions, slot_mapping = [], [], []
@@ -237,17 +270,27 @@ class ModelRunner:
         return self._to_device(input_ids, torch.int64), self._to_device(positions, torch.int64)
 
     def prepare_decode(self, seqs: list[Sequence]):
-        input_ids, positions, slot_mapping, context_lens = [], [], [], []
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+        n = len(seqs)
+        input_ids = np.empty(n, dtype=np.int64)
+        positions = np.empty(n, dtype=np.int64)
+        slot_mapping = np.empty(n, dtype=np.int32)
+        context_lens = np.empty(n, dtype=np.int32)
+        max_len = max(len(seq.block_table) for seq in seqs)
+        table = np.full((n, max_len), -1, dtype=np.int32)
+        bs = self.block_size
+        for i, seq in enumerate(seqs):
+            input_ids[i] = seq.last_token
+            length = len(seq)
+            positions[i] = length - 1
+            context_lens[i] = length
+            bt = seq.block_table
+            table[i, : len(bt)] = bt
+            slot_mapping[i] = bt[-1] * bs + seq.last_block_num_tokens - 1
         set_context(
             False,
             slot_mapping=self._to_device(slot_mapping, torch.int32),
             context_lens=self._to_device(context_lens, torch.int32),
-            block_tables=self.prepare_block_tables(seqs),
+            block_tables=self._to_device(table, torch.int32),
         )
         return self._to_device(input_ids, torch.int64), self._to_device(positions, torch.int64)
 
@@ -256,13 +299,34 @@ class ModelRunner:
 
     # ---------------- 前向 ----------------
 
+    def _plan_flashinfer(self, block_tables: torch.Tensor, context_lens: torch.Tensor) -> None:
+        attn = self._fi_attn
+        page = self.block_size
+        max_pages = (self.config.max_model_len + page - 1) // page
+        plan_decode(
+            block_tables,
+            context_lens,
+            attn.num_heads,
+            attn.num_kv_heads,
+            attn.head_dim,
+            page,
+            self.config.torch_dtype,
+            attn.k_cache.dtype,
+            attn.scale,
+            max_pages,
+        )
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool) -> torch.Tensor:
         bs = input_ids.size(0)
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
+            if self.flashinfer_decode and not is_prefill:
+                context = get_context()
+                self._plan_flashinfer(context.block_tables, context.context_lens)
             return self.model.compute_logits(self.model(input_ids, positions))
         context = get_context()
-        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        bucket = next(x for x in self.graph_bs if x >= bs)
+        graph = self.graphs[bucket]
         graph_vars = self.graph_vars
         graph_vars["input_ids"][:bs] = input_ids
         graph_vars["positions"][:bs] = positions
@@ -271,6 +335,11 @@ class ModelRunner:
         graph_vars["context_lens"].zero_()
         graph_vars["context_lens"][:bs] = context.context_lens
         graph_vars["block_tables"][:bs, : context.block_tables.size(1)] = context.block_tables
+        if self.flashinfer_decode:
+            if bucket > bs:
+                graph_vars["context_lens"][bs:bucket] = 1
+                graph_vars["block_tables"][bs:bucket].zero_()
+            self._plan_flashinfer(graph_vars["block_tables"][:bucket], graph_vars["context_lens"][:bucket])
         graph.replay()
         if self.graph_logits:
             return graph_vars["logits"][:bs]
@@ -306,13 +375,20 @@ class ModelRunner:
         self.graph_logits = self.world_size == 1
         vocab = config.hf_config.vocab_size
         logits = torch.zeros(max_bs, vocab, dtype=config.torch_dtype) if self.graph_logits else None
-        self.graph_bs = sorted({bs for bs in [1, 2, 4, 8, *range(16, max_bs + 1, 16)] if bs <= max_bs} | {max_bs})
+        # 16 一档时，常驻大约 40 条会被抬到 48，多读 20% 的 KV。
+        # 长上下文 decode 吃带宽，这一档空白直接变成墙钟。8 一档盖住这条工作负载的常驻 batch。
+        self.graph_bs = sorted(
+            {bs for bs in [1, 2, 4, 8, *range(16, min(max_bs, 128) + 1, 8), *range(144, max_bs + 1, 16)] if 0 < bs <= max_bs}
+            | {max_bs}
+        )
         self.graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            if self.flashinfer_decode:
+                self._plan_flashinfer(block_tables[:bs], context_lens[:bs])
             hidden = self.model(input_ids[:bs], positions[:bs])
             if self.graph_logits:
                 logits[:bs] = self.model.compute_logits(hidden)

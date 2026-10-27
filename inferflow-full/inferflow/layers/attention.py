@@ -16,6 +16,8 @@ try:
 except ImportError:
     flash_attn_varlen_func = flash_attn_with_kvcache = None
 
+from inferflow.layers.flashinfer_decode import flashinfer_decode_enabled, flashinfer_paged_prefill, flashinfer_run
+
 
 if triton is not None:
 
@@ -142,17 +144,36 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         use_flash = flash_attn_varlen_func is not None and q.is_cuda
+        # 长上下文 decode 用 FlashInfer。K/V 先写入页，kernel 按 context_lens 读完整长度。
+        use_flashinfer = (
+            not context.is_prefill
+            and k_cache.numel() > 0
+            and q.is_cuda
+            and flashinfer_decode_enabled()
+        )
         # decode 把新的 K/V 交给 flash_attn_with_kvcache 写入，省掉每层一次额外的 store kernel。
-        fuse_decode_store = use_flash and not context.is_prefill and k_cache.numel()
+        fuse_decode_store = use_flash and not context.is_prefill and k_cache.numel() and not use_flashinfer
         if k_cache.numel() and v_cache.numel() and not fuse_decode_store:
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping, store_k=not k_in_cache)
+        if use_flashinfer:
+            return flashinfer_run(q, k_cache, v_cache)
         if not use_flash:
             return reference_attention(q, k, v, k_cache, v_cache, context, self.scale)
         if context.is_prefill:
             if context.block_tables is not None:
+                seqused_k = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
+                if k_cache.dtype != q.dtype:
+                    return flashinfer_paged_prefill(
+                        q,
+                        k_cache,
+                        v_cache,
+                        context.block_tables,
+                        context.cu_seqlens_q,
+                        context.cu_seqlens_k,
+                        self.scale,
+                    )
                 # KV 已由 store_kvcache 写入。FA3 的 varlen 接口没有 page table，
                 # 前缀命中时用 with_kvcache 的变长 query 从分页 cache 读取完整 K/V。
-                seqused_k = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
                 return flash_attn_with_kvcache(
                     q,
                     k_cache,

@@ -73,6 +73,7 @@ class Qwen3Attention(nn.Module):
             and q.is_cuda
             and context.is_prefill
             and k_cache.numel() > 0
+            and k_cache.dtype == q.dtype
             and context.slot_mapping is not None
             and context.slot_mapping.numel() == q.shape[0]
         )
