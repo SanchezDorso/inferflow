@@ -21,16 +21,15 @@ if triton is not None:
         V,
         seed,
         BLOCK: tl.constexpr,
-        N_BLOCKS: tl.constexpr,
     ):
         row = tl.program_id(0)
         t = tl.load(temp_ptr + row).to(tl.float32)
         t_safe = tl.where(t == 0, 1.0, t)
         base = logits_ptr + row * stride
         best_score = tl.full((), -1.0e30, tl.float32)
-        best_idx = tl.zeros((), tl.int32)
-        for block_id in tl.static_range(N_BLOCKS):
-            start = block_id * BLOCK
+        best_idx = tl.full((), 0, tl.int32)
+        start = 0
+        while start < V:
             offs = start + tl.arange(0, BLOCK)
             mask = offs < V
             logit = tl.load(base + offs, mask=mask, other=-1.0e30).to(tl.float32)
@@ -45,6 +44,7 @@ if triton is not None:
             take = local_max > best_score
             best_score = tl.where(take, local_max, best_score)
             best_idx = tl.where(take, start + local_idx, best_idx)
+            start += BLOCK
         tl.store(out_ptr + row, best_idx.to(tl.int64))
 
 
@@ -52,7 +52,6 @@ def _gumbel_argmax(logits: torch.Tensor, temperatures: torch.Tensor, seed: int) 
     batch, vocab = logits.shape
     out = torch.empty(batch, dtype=torch.int64, device=logits.device)
     block = 1024
-    n_blocks = triton.cdiv(vocab, block)
     _gumbel_argmax_kernel[(batch,)](
         logits,
         temperatures,
@@ -61,7 +60,7 @@ def _gumbel_argmax(logits: torch.Tensor, temperatures: torch.Tensor, seed: int) 
         vocab,
         seed,
         block,
-        n_blocks,
+        num_warps=4,
     )
     return out
 
