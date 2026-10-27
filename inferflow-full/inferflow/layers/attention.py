@@ -29,38 +29,52 @@ if triton is not None:
         v_cache_ptr,
         slot_mapping_ptr,
         D: tl.constexpr,
+        STORE_K: tl.constexpr,
     ):
         idx = tl.program_id(0)
         slot = tl.load(slot_mapping_ptr + idx)
         if slot == -1:
             return
-        key = tl.load(key_ptr + idx * key_stride + tl.arange(0, D))
-        value = tl.load(value_ptr + idx * value_stride + tl.arange(0, D))
         cache_offsets = slot * D + tl.arange(0, D)
-        tl.store(k_cache_ptr + cache_offsets, key)
+        if STORE_K:
+            key = tl.load(key_ptr + idx * key_stride + tl.arange(0, D))
+            tl.store(k_cache_ptr + cache_offsets, key)
+        value = tl.load(value_ptr + idx * value_stride + tl.arange(0, D))
         tl.store(v_cache_ptr + cache_offsets, value)
 
 
 def store_kvcache(
-    key: torch.Tensor,
+    key: torch.Tensor | None,
     value: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    store_k: bool = True,
 ):
-    """把本步新算出的 K/V 按 slot_mapping 写入分页 KV cache，slot == -1 表示跳过（CUDA Graph 的 padding）。"""
-    N, num_heads, head_dim = key.shape
+    """把本步新算出的 K/V 按 slot_mapping 写入分页 KV cache，slot == -1 表示跳过（CUDA Graph 的 padding）。
+
+    store_k=False 时 K 已经由 fused QK kernel 写入页，这里只写 V。
+    """
+    N, num_heads, head_dim = value.shape
     D = num_heads * head_dim
     assert slot_mapping.numel() == N
-    if triton is not None and key.is_cuda and (D & (D - 1)) == 0:
-        assert key.stride(-1) == 1 and value.stride(-1) == 1
-        assert key.stride(1) == head_dim and value.stride(1) == head_dim
-        assert k_cache.stride(1) == D and v_cache.stride(1) == D
-        store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+    if store_k:
+        assert key is not None and key.shape == value.shape
+    if triton is not None and value.is_cuda and (D & (D - 1)) == 0:
+        assert value.stride(-1) == 1 and value.stride(1) == head_dim and v_cache.stride(1) == D
+        if store_k:
+            assert key.stride(-1) == 1 and key.stride(1) == head_dim and k_cache.stride(1) == D
+            key_ptr, key_stride = key, key.stride(0)
+        else:
+            key_ptr, key_stride = value, value.stride(0)
+        store_kvcache_kernel[(N,)](
+            key_ptr, key_stride, value, value.stride(0), k_cache, v_cache, slot_mapping, D, store_k
+        )
         return
     valid = slot_mapping >= 0
     slots = slot_mapping[valid].long()
-    k_cache.view(-1, num_heads, head_dim)[slots] = key[valid]
+    if store_k:
+        k_cache.view(-1, num_heads, head_dim)[slots] = key[valid]
     v_cache.view(-1, num_heads, head_dim)[slots] = value[valid]
 
 
@@ -124,14 +138,14 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, k_in_cache: bool = False) -> torch.Tensor:
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         use_flash = flash_attn_varlen_func is not None and q.is_cuda
         # decode 把新的 K/V 交给 flash_attn_with_kvcache 写入，省掉每层一次额外的 store kernel。
         fuse_decode_store = use_flash and not context.is_prefill and k_cache.numel()
         if k_cache.numel() and v_cache.numel() and not fuse_decode_store:
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping, store_k=not k_in_cache)
         if not use_flash:
             return reference_attention(q, k, v, k_cache, v_cache, context, self.scale)
         if context.is_prefill:

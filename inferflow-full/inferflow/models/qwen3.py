@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -5,9 +7,16 @@ from torch import nn
 from inferflow.layers.activation import SiluAndMul
 from inferflow.layers.attention import Attention
 from inferflow.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
+from inferflow.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from inferflow.layers.layernorm import RMSNorm
 from inferflow.layers.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from inferflow.layers.rotary_embedding import get_rope
+from inferflow.utils.context import get_context
+
+try:
+    import triton
+except ImportError:
+    triton = None
 
 
 def get_rope_theta(config) -> float:
@@ -53,11 +62,41 @@ class Qwen3Attention(nn.Module):
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
+        context = get_context()
+        k_cache = self.attn.k_cache
+        # prefill 且 KV 页已经分配时，旋转后的 K 直接写入页，不再经过单独的 store kernel。
+        write_k_cache = (
+            triton is not None
+            and q.is_cuda
+            and context.is_prefill
+            and k_cache.numel() > 0
+            and context.slot_mapping is not None
+            and context.slot_mapping.numel() == q.shape[0]
+        )
+        if triton is not None and q.is_cuda and os.environ.get("INFERFLOW_FUSED_QK", "1") != "0":
+            # 前缀命中或混批时注意力从页里读 K，不必再把 K 写成一份连续张量。
+            q, k_out = fused_qk_norm_rope(
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.q_norm.eps,
+                k_cache if write_k_cache else None,
+                context.slot_mapping if write_k_cache else None,
+                write_k_out=not (write_k_cache and context.block_tables is not None),
+            )
+            k = k_out
+        else:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            q, k = self.rotary_emb(positions, q, k)
+            write_k_cache = False
+        o = self.attn(q, k, v, k_in_cache=write_k_cache)
         return self.o_proj(o.flatten(1, -1))
 
 
