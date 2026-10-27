@@ -6,7 +6,9 @@ from typing import Any
 @dataclass
 class Config:
     model: str
-    max_num_batched_tokens: int = 16384
+    # 4096 上下文时一步塞进约 16 条 prefill，GEMM 比 16384（约 4 条）更吃满。
+    # 代价是激活峰值更高，KV 容量略减。短请求仍能放下。
+    max_num_batched_tokens: int = 65536
     max_num_seqs: int = 512
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
