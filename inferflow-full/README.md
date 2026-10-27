@@ -4,7 +4,7 @@
 
 - **张量并行（TP）多进程推理**：rank 0 负责调度与采样，其余 rank 在子进程中执行；控制面通过共享内存 + Event 做 RPC，数据面通过 NCCL all-reduce / gather 通信
 - **连续批处理（Continuous Batching）**：每一步重新调度，已完成的序列立即释放资源，新请求随时加入；默认最多 512 条并发序列
-- **分页 KV Cache（PagedAttention）**：KV 按 256 token 为一块管理，prefill / decode 均通过 `block_table` 调用 FlashAttention
+- **分页 KV Cache（PagedAttention）**：KV 按 16 token 为一块管理，prefill / decode 通过 `block_table` 调用 FlashAttention 3
 - **两阶段调度 + 抢占回滚**：Prefill 严格 FIFO；Decode 显存不足时从队尾抢占，释放 KV 块、状态回滚为 WAITING，之后以 recompute 方式恢复
 - **前缀缓存（Prefix Caching）**：链式哈希匹配已有 KV 块，引用计数共享，空闲块保留内容当作 LRU 缓存
 - **CUDA Graph**：decode 阶段按 batch size 分档录制，减少 kernel launch 开销
@@ -26,7 +26,7 @@ inferflow/
 ├── layers/
 │   ├── linear.py           # Column / Row / QKV / MergedColumn 并行线性层
 │   ├── embed_head.py       # 词表并行 Embedding / LMHead
-│   ├── attention.py        # Triton 写 KV cache + FlashAttention（paged）
+│   ├── attention.py        # Triton 写 KV cache + FlashAttention 3（paged）
 │   ├── rotary_embedding.py # RoPE
 │   ├── layernorm.py        # RMSNorm（融合 residual add）
 │   ├── activation.py       # SiLU * gate
@@ -36,7 +36,7 @@ inferflow/
     ├── context.py          # 前向注意力元数据（cu_seqlens / slot_mapping / block_tables ...）
     └── loader.py           # safetensors 权重加载（按 TP rank 切分）
 scripts/
-├── setup_env.sh            # GPU 机器一键安装环境（torch + flash-attn 预编译 wheel）
+├── setup_env.sh            # GPU 机器一键安装环境（torch + flash-attn-3 预编译 wheel）
 ├── download_model.sh       # 下载模型
 └── check_env.py            # 环境自检
 tests/                      # 单测 + 端到端对比测试
@@ -45,12 +45,12 @@ example.py / bench.py       # 示例与吞吐基准
 
 ## 部署
 
-需要 Linux + NVIDIA GPU（Ampere 及以上，FlashAttention 2 要求），Python 3.10~3.12。
+需要 Linux + NVIDIA GPU（Ampere 及以上，FlashAttention 3），Python 3.10~3.12。
 
 ```bash
-# 1. 安装环境（默认创建 ./.venv；torch 2.7.1 + cu126 + flash-attn 2.8.3）
+# 1. 安装环境（默认创建 ./.venv；torch 2.9.1 + cu126 + flash-attn-3 3.0.1）
 bash scripts/setup_env.sh
-#   国内网络可加：PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple GH_PROXY=https://ghfast.top/
+#   国内网络可加：PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 #   驱动较旧可换：TORCH_CUDA=cu118 或 cu124
 source .venv/bin/activate
 
@@ -84,7 +84,7 @@ print(outputs[0]["text"])
 | `max_num_batched_tokens` | 16384 | 单次 prefill 的 token 上限 |
 | `max_model_len` | 4096 | 单序列最大长度 |
 | `gpu_memory_utilization` | 0.9 | KV cache 可用显存比例 |
-| `kvcache_block_size` | 256 | KV 块大小（flash-attn 要求 256 的倍数） |
+| `kvcache_block_size` | 16 | KV 块大小，也是前缀缓存的命中粒度 |
 | `num_kvcache_blocks` | -1 | >0 时限制 KV 块数，便于复现抢占 |
 | `enable_prefix_caching` | True | 前缀缓存 |
 | `enforce_eager` | False | 关闭 CUDA Graph |

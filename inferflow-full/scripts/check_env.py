@@ -1,4 +1,4 @@
-"""检查 GPU 推理环境是否就绪：torch / CUDA / triton / flash-attn / NCCL，并跑一次最小的 flash-attn 调用。"""
+"""检查 GPU 推理环境是否就绪：torch / CUDA / triton / flash-attn 3 / NCCL，并跑一次最小的分页注意力。"""
 
 import importlib
 import sys
@@ -26,7 +26,7 @@ def main():
             print(f"      GPU{i}: {p.name}, {p.total_memory / 2**30:.1f} GiB, sm_{p.major}{p.minor}")
         ok &= status("nccl", torch.distributed.is_nccl_available(), str(torch.cuda.nccl.version()))
 
-    for mod in ("triton", "transformers", "flash_attn", "xxhash", "safetensors"):
+    for mod in ("triton", "transformers", "flash_attn_3", "xxhash", "safetensors"):
         try:
             m = importlib.import_module(mod)
             ok &= status(mod, True, getattr(m, "__version__", ""))
@@ -35,14 +35,15 @@ def main():
 
     if cuda:
         try:
-            from flash_attn import flash_attn_with_kvcache
+            from flash_attn_interface import flash_attn_with_kvcache
 
             q = torch.randn(2, 1, 8, 128, device="cuda", dtype=torch.bfloat16)
-            kc = torch.randn(4, 256, 8, 128, device="cuda", dtype=torch.bfloat16)
+            kc = torch.randn(4, 16, 8, 128, device="cuda", dtype=torch.bfloat16)
+            vc = torch.randn_like(kc)
             bt = torch.tensor([[0, 1], [2, 3]], device="cuda", dtype=torch.int32)
-            lens = torch.tensor([300, 10], device="cuda", dtype=torch.int32)
-            flash_attn_with_kvcache(q, kc, kc, cache_seqlens=lens, block_table=bt, causal=True)
-            ok &= status("paged-attn", True, "flash_attn_with_kvcache + block_table works")
+            lens = torch.tensor([20, 10], device="cuda", dtype=torch.int32)
+            flash_attn_with_kvcache(q, kc, vc, cache_seqlens=lens, page_table=bt, causal=True, num_splits=1)
+            ok &= status("paged-attn", True, "flash_attn_3 flash_attn_with_kvcache + page_table works")
         except Exception as e:
             ok &= status("paged-attn", False, repr(e))
 

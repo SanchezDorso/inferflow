@@ -12,7 +12,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
-    kvcache_block_size: int = 256
+    kvcache_block_size: int = 16
     num_kvcache_blocks: int = -1
     enable_prefix_caching: bool = True
     dist_port: int = 2333
@@ -27,8 +27,8 @@ class Config:
 
         assert os.path.isdir(self.model), f"model path not found: {self.model}"
         assert self.device in ("cuda", "cpu")
-        # flash_attn 的 paged KV 接口要求 page size 是 256 的倍数
-        assert self.kvcache_block_size % 256 == 0
+        # FlashAttention 3 的 page 大小可以不是 256。16 token 一块让前缀缓存按更短的满块命中。
+        assert self.kvcache_block_size > 0
         assert 1 <= self.tensor_parallel_size <= 8
         assert 0.0 < self.gpu_memory_utilization <= 1.0
         self.hf_config = AutoConfig.from_pretrained(self.model)

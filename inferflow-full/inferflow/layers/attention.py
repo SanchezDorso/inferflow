@@ -11,7 +11,8 @@ except ImportError:
     triton = None
 
 try:
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    # FlashAttention 3：分页 KV 走 page_table，变长 prefill 不再接受 block_table。
+    from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 except ImportError:
     flash_attn_varlen_func = flash_attn_with_kvcache = None
 
@@ -108,10 +109,11 @@ def reference_attention(q, k, v, k_cache, v_cache, context, scale):
 
 class Attention(nn.Module):
     """
-    分页注意力：
+    分页注意力（FlashAttention 3）：
     - prefill：flash_attn_varlen_func 处理变长拼接的一批序列；命中前缀缓存时
-      直接以分页 KV cache + block_table 作为 K/V 源；
-    - decode：flash_attn_with_kvcache 每条序列 1 个 query，按 block_table 读取历史 KV。
+      改用 flash_attn_with_kvcache，以 page_table 读取已写入的分页 KV；
+    - decode：flash_attn_with_kvcache 每条序列 1 个 query，按 page_table 读取历史 KV，
+      并把本步新的 K/V 追加进 cache。
     """
 
     def __init__(self, num_heads: int, head_dim: int, scale: float, num_kv_heads: int):
@@ -134,20 +136,33 @@ class Attention(nn.Module):
             return reference_attention(q, k, v, k_cache, v_cache, context, self.scale)
         if context.is_prefill:
             if context.block_tables is not None:
-                k, v = k_cache, v_cache
+                # KV 已由 store_kvcache 写入。FA3 的 varlen 接口没有 page table，
+                # 前缀命中时用 with_kvcache 的变长 query 从分页 cache 读取完整 K/V。
+                seqused_k = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
+                return flash_attn_with_kvcache(
+                    q,
+                    k_cache,
+                    v_cache,
+                    cache_seqlens=seqused_k,
+                    page_table=context.block_tables,
+                    cu_seqlens_q=context.cu_seqlens_q,
+                    max_seqlen_q=context.max_seqlen_q,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
             return flash_attn_varlen_func(
                 q,
                 k,
                 v,
-                max_seqlen_q=context.max_seqlen_q,
                 cu_seqlens_q=context.cu_seqlens_q,
-                max_seqlen_k=context.max_seqlen_k,
                 cu_seqlens_k=context.cu_seqlens_k,
+                max_seqlen_q=context.max_seqlen_q,
+                max_seqlen_k=context.max_seqlen_k,
                 softmax_scale=self.scale,
                 causal=True,
-                block_table=context.block_tables,
             )
         # cache_seqlens 是写入前的长度，kernel 从这里追加本步的 K/V。
+        # num_splits=1：避免按当前长度在 host 上选切分，CUDA Graph 重放时长度会变。
         return flash_attn_with_kvcache(
             q.unsqueeze(1),
             k_cache,
@@ -155,7 +170,8 @@ class Attention(nn.Module):
             k=k.unsqueeze(1),
             v=v.unsqueeze(1),
             cache_seqlens=context.context_lens - 1,
-            block_table=context.block_tables,
+            page_table=context.block_tables,
             softmax_scale=self.scale,
             causal=True,
+            num_splits=1,
         )

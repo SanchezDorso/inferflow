@@ -59,17 +59,17 @@ def test_prefix_cache_reuse(model_dir):
     try:
         _check(llm, model_dir, prompts[:1], max_tokens=8)
         _check(llm, model_dir, prompts[1:], max_tokens=8)
-        # 600 token 共享前缀 → 两个完整块（512 tokens）命中
-        assert llm.stats()["prefix_hit_tokens"] >= 512
+        # 600 token 共享前缀，块大小 16：37 个满块命中，最后不足一块重算
+        assert llm.stats()["prefix_hit_tokens"] >= 37 * 16
     finally:
         llm.exit()
 
 
 def test_preemption_rollback(model_dir):
     rng = random.Random(2)
-    prompts = [_rand_prompt(rng, 250) for _ in range(3)]
-    # 5 个块只够 2 条序列跨过 256 边界，第三条必然被抢占后重算
-    llm = _make_llm(model_dir, max_model_len=1024, num_kvcache_blocks=5)
+    prompts = [_rand_prompt(rng, 15) for _ in range(3)]
+    # 4 个 16-token 块：3 条请求各占 1 块，跨过 16 边界时只剩 1 个空闲块，必然抢占
+    llm = _make_llm(model_dir, max_model_len=64, num_kvcache_blocks=4)
     try:
         _check(llm, model_dir, prompts, max_tokens=20)
         assert llm.stats()["num_preemptions"] > 0
